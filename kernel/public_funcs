@@ -1,0 +1,963 @@
+#!/bin/bash
+
+# the default zstd compress level is 3
+export ZSTD_LEVEL=6
+
+get_random_mac ()
+{
+    # MAC地址第一段可在 02 06 0A 0E 中任选一个
+    if [ "$SHELL" == "/bin/bash" ];then
+        #MACADDR=$(printf "%02X:%02X:%02X:%02X:%02X:%02X\n" $[RANDOM%255] $[RANDOM%255] $[RANDOM%255] $[RANDOM%255] $[RANDOM%255] $[RANDOM%255])
+        MACADDR=$(printf "06:%02X:%02X:%02X:%02X:%02X\n" $[RANDOM%255] $[RANDOM%255] $[RANDOM%255] $[RANDOM%255] $[RANDOM%255])
+    else
+        uuid=$(cat /proc/sys/kernel/random/uuid)
+        mac1="0E"
+        #mac1=${uuid:24:2}
+        mac2=${uuid:26:2}
+        mac3=${uuid:28:2}
+        mac4=${uuid:30:2}
+        mac5=${uuid:32:2}
+        mac6=${uuid:34:2}
+        MACADDR=$(echo "$mac1:$mac2:$mac3:$mac4:$mac5:$mac6" | tr '[a-z]' '[A-Z]')
+    fi
+}
+
+function check_file() {
+    if [ ! -f "$1" ];then
+        echo "文件: [$1] 不存在!"
+        if [ "$2" == "" ];then
+            exit 1
+        else
+            sleep $2
+        fi
+    fi
+}
+
+function check_dir() {
+    if [ ! -d "$1" ];then
+        echo "目录: [$1] 不存在!"
+        if [ "$2" == "" ];then
+            exit 1
+        else
+            sleep $2
+        fi
+    fi
+}
+
+function check_block_dev() {
+    if [ ! -b "$1" ];then
+        echo "块设备: [$1] 不存在!"
+        if [ "$2" == "" ];then
+            exit 1
+        else
+            sleep $2
+        fi
+    fi
+}
+
+# 此函数原有的用途是检查内核版本是否 >= 5.10, 现改为检查内核的 text_offset 是否为 0x01080000
+# text offset: 
+#   0x01080000  适用晶晨盒子厂商 bootloader 以及 主线 bootloader, 已过时
+#   0x00000000  适用主线 bootloader, 但不适用晶晨厂商 bootloader
+function get_k510_from_vmlinuz() {
+    local vmlinuz=$1
+    local temp_script=$(mktemp) 
+    cat > $temp_script <<EOF
+use strict;
+my \$filename = \$ARGV[0];
+open my \$fh, '<', \$filename or die;
+binmode \$fh;
+seek \$fh, 0x8, 0;
+my \$buf = "";
+read \$fh, \$buf, 0x4;
+close(\$fh);
+my \$str = unpack 'H*', \$buf; 
+print "\$str\n";
+EOF
+    local result=1
+    local text_offset=$(perl "$temp_script" "$vmlinuz")
+    [ "$text_offset" == "00000801" ] && result=0
+    rm -f $temp_script
+    echo "$result"
+}
+
+function get_k510_from_boot_tgz() {
+    local boot_tgz=$1
+    local vmlinuz=$2
+    local temp_dir=$(mktemp -d)
+    ( 
+      cd $temp_dir
+      tar xzf "$boot_tgz" "$vmlinuz"
+    )
+    local result=$(get_k510_from_vmlinuz "${temp_dir}/${vmlinuz}")
+    rm -rf $temp_dir
+    echo "$result"
+}
+
+function check_depends() {
+    if [ $(id -u) -ne 0 ];then
+        echo "这个脚本需要用root用户来执行，你好象不是root吧？"
+        exit 1
+    fi
+
+    if mkfs.btrfs -V >/dev/null;then
+        echo "check mkfs.btrfs ok"
+    else
+        echo "mkfs.btrfs 程序不存在，请安装 btrfs-progs"
+        exit 1
+    fi
+
+    if mkfs.vfat --help 1>/dev/nul 2>&1;then
+        echo "check mkfs.vfat ok"
+    else
+        echo "mkfs.vfat 程序不存在，请安装 dosfstools"
+        exit 1
+    fi
+
+    if gawk --version >/dev/null;then
+        echo "check gawk ok"
+    else
+        echo "gawk 程序不存在，请安装 gawk"
+        exit 1
+    fi
+
+    if uuidgen>/dev/null;then
+        echo "check uuidgen ok"
+    else
+        echo "uuidgen 程序不存在，请安装 uuid-runtime"
+        exit 1
+    fi
+
+    if losetup -V >/dev/null;then
+        echo "check losetup ok"
+    else
+        echo "losetup 程序不存在，请安装 mount"
+        exit 1
+    fi
+
+    lsblk_version=$(lsblk --version|awk '{print $NF}' 2>/dev/null)
+    if [ "$lsblk_version" != "" ];then
+        m_v=$(echo ${lsblk_version} | cut -d '.' -f1)
+        s_v=$(echo ${lsblk_version} | cut -d '.' -f2)
+        if [ $m_v -gt 2 ] || [ $m_v -eq 2 ] && [ $s_v -ge 33 ];then
+            echo "check lsblk ok"
+        else
+            echo "lsblk 需要版本 2.33 或更高的版本, 当前的版本是 $lsblk_version !"
+            exit 1
+        fi        
+    else
+        echo "lsblk 程序不存在，请安装 util-linux"
+        exit 1
+    fi
+
+    if fdisk --version >/dev/null 2>&1;then
+        echo "check fdisk ok"
+    else
+        echo "fdisk 程序不存在，请安装 fdisk"
+        exit 1
+    fi
+
+    if parted --version >/dev/null 2>&1;then
+        echo "check parted ok"
+    else
+        echo "parted 程序不存在，请安装 parted"
+        exit 1
+    fi
+
+    # 创建 kvm 虚拟机镜像需要 qemu-img
+    if [ "$EFI" == "1" ];then
+        if qemu-img --version >/dev/null 2>&1;then
+            echo "check qemu-img ok"
+        else
+            echo "qemu-img 程序不存在，请安装 qemu-utils"
+            exit 1
+        fi
+    fi
+    echo
+}
+
+function wait_dev() {
+    while [ ! -b $1 ];do
+        echo "wait for $1 ..."
+        sleep 1
+    done
+    sleep 1
+}
+
+function init_work_env() {
+    export WORK_DIR="${PWD}/tmp"
+    [ -d ${WORK_DIR} ] || mkdir -p ${WORK_DIR}
+    echo "The work directory is : [$WORK_DIR]"
+
+    export TEMP_DIR=$(mktemp -p $WORK_DIR)
+    rm -rf $TEMP_DIR
+    mkdir -p $TEMP_DIR
+    echo "The temporary directory is : [$TEMP_DIR]"
+
+    if [ "$EFI" == "1" ];then
+        export TGT_BOOT=${TEMP_DIR}/tgt_efi
+        echo "The target efi directory is : [$TGT_BOOT]"
+    else
+        export TGT_BOOT=${TEMP_DIR}/tgt_boot
+        echo "The target boot directory is : [$TGT_BOOT]"
+    fi
+    export TGT_ROOT=${TEMP_DIR}/tgt_root
+    mkdir -p $TGT_BOOT $TGT_ROOT
+    echo "The target rootfs directory is : [$TGT_ROOT]"
+
+    export OUTPUT_DIR="${PWD}/output/"
+    [ -d ${OUTPUT_DIR} ] || mkdir -p ${OUTPUT_DIR}
+    echo "The output directory is : [$OUTPUT_DIR]"
+
+    losetup -D
+    echo 
+}
+
+function detach_loopdev() {
+    cd ${TEMP_DIR}
+    umount -f * 2>/dev/null
+    losetup -D
+    cd ${WORK_DIR}
+    rm -rf ${TEMP_DIR}
+}
+
+function create_image() {
+    local img_name=$1
+    local size_mb=$2
+    if [ "$img_name" == "" ];then
+        echo "镜像名称为空，请指定一个具体的镜像名称！"
+        exit 1
+    fi
+
+    if [ "$size_mb" == "" ];then
+        echo "镜像大小为空，请指定不小于 1 的整数尺寸！"
+        exit 1
+    fi
+    
+    echo "创建空白的目标镜像文件, 大小是 $size_mb MB  ... "
+    dd if=/dev/zero of="$img_name" bs=1M count=$size_mb conv=fsync && sync
+    if [ $? -ne 0 ];then
+        echo "空白镜像创建失败！"
+        exit 1
+    else
+        echo "空白镜像创建成功"
+    fi
+
+    echo -n "设置分区循环设备 ... "
+    losetup -f -P "$img_name"
+    if [ $? -ne 0 ];then
+        echo "失败！"
+        exit 1
+    else
+        TGT_DEV=$(losetup | grep "$img_name" | gawk '{print $1}')
+        export TGT_DEV
+        echo "成功: [$TGT_DEV]"
+    fi
+    echo
+}
+
+# 创建分区(允许在空白磁盘里新建分区，也允许在现有分区表中扩充分区)
+# 参数1： 块设备名
+# 参数2： 分区表类型： msdos|gpt|auto  auto表示在现有的磁盘中添加新分区
+# 参数3+4+5： 分区1跳过MB 分区1大小MB 分区1类型
+# 参数6+7+8： 分区2跳过MB 分区2大小MB 分区2类型
+# 参数9+10+11： 分区3跳过MB 分区3大小MB 分区3类型
+# 参数12+13+14: 分区4跳过MB 分区4大小MB 分区4类型
+# ...
+function create_partition() {
+    local device_name=$1
+    check_block_dev $device_name
+    shift
+
+    local partition_label=$1
+    shift
+
+    local max_pt_cnt
+    local cur_pt_cnt=0
+    case ${partition_label} in
+        msdos) max_pt_cnt=4
+               ;;
+          gpt) max_pt_cnt=128
+               ;;
+         auto) local label=$(parted $device_name print 2>/dev/null | gawk '$NF ~ /&msdos$/ || $NF ~ /^gpt$/ || $NF ~ /^unknown$/ {print $NF}')
+               case $label in 
+                   msdos) partition_label="msdos"
+                          max_pt_cnt=4
+                          cur_pt_cnt=$(parted $device_name print | gawk '$1 ~ /^[0-9]+$/ {print $1}' | tail -n1)
+                          [ "$cur_pt_cnt" == "" ] && cur_pt_cnt=0
+                          ;;
+                     gpt) partition_label="gpt"
+                          max_pt_cnt=128
+                          cur_pt_cnt=$(parted $device_name print | gawk '$1 ~ /^[0-9]+$/ {print $1}' | tail -n1)
+                          [ "$cur_pt_cnt" == "" ] && cur_pt_cnt=0
+                          ;;
+                       *) # 自动模式下，如果检测到空白磁盘，将会用msdos格式新建分区表
+                          partition_label="msdos"
+                          max_pt_cnt=4
+                          cur_pt_cnt=0
+                          ;;
+               esac
+               ;;
+            *) echo "未指定分区表类型, 必须为 gpt|msdos|auto"
+               exit 1
+               ;;
+    esac
+
+    echo "对磁盘设备 [$device_name] 进行分区 ..."
+    if [ $cur_pt_cnt -eq 0 ];then
+        echo -n "创建新的分区表 ... "
+        parted -s ${device_name} mklabel ${partition_label} 2>/dev/null
+        if [ $? -ne 0 ];then
+            echo "失败!"
+            detach_loopdev
+            exit 1
+        else
+            echo "成功"
+        fi
+    fi
+
+    local start=0
+    if [ $cur_pt_cnt -gt 0 ];then
+        start=$(fdisk -l $device_name | tail -n1 | gawk '{ print ($3 + 1) / 512 * 1024 * 1024 }')
+    fi
+    i=$((cur_pt_cnt + 1))
+    while [ $i -le ${max_pt_cnt} ]; do
+        local skip_mb=$1
+        shift
+        local pt_size=$1
+        shift
+        local pt_type=$1
+        shift
+	local pt_idx=$i
+        
+        if [ "$skip_mb" == "" ] || [ "$pt_size" == "" ] || [ "$pt_type" == "" ];then
+            break
+        fi            
+
+	local esp_on=0
+	local lvm_on=0
+	if [ "$pt_type" == "efi" ];then
+	    pt_type="fat32"
+	    esp_on=1
+	elif [ "$pt_type" == "lvm" ];then
+	    pt_type="ext2"
+	    lvm_on=1
+	fi
+
+        start=$(( skip_mb * 1024 * 1024 + start ))
+
+        local end
+        if [ "${pt_size}" == "-1" ] || [ "${pt_size}" == "100%" ];then
+            echo -n "创建第 [$i] 个分区, 分区大小: 所有剩余空间, 分区类型: [$pt_type] ... "
+            parted -s ${device_name} mkpart primary ${pt_type} ${start}b "100%" 2>/dev/null
+            if [ $? -ne 0 ];then
+                echo "失败!"
+                detach_loopdev
+                exit 1
+            else
+                echo "成功"
+                break
+            fi
+        else
+            end=$(( pt_size * 1024 * 1024 +  start - 1 ))
+            echo -n "创建第 [$i] 个分区, 分区大小: [$pt_size] MB, 分区类型: [$pt_type] ... "
+            parted -s ${device_name} mkpart primary ${pt_type} ${start}b ${end}b 2>/dev/null
+            if [ $? -ne 0 ];then
+                echo "失败!"
+                detach_loopdev
+                exit 1
+            else
+                echo "成功"
+            fi
+        fi
+
+	if [ "$esp_on" == "1" ];then
+            parted -s ${device_name} set $pt_idx esp on
+	elif [ "$lvm_on" == "1" ];then
+            parted -s ${device_name} set $pt_idx lvm on
+        fi
+
+        start=$(( end + 1 ))
+        i=$((i + 1))
+    done
+
+    echo "[$device_name] 磁盘分区一览:"
+    echo "==================================================================="
+    fdisk -l $device_name 2>/dev/null
+    echo "==================================================================="
+    echo
+}
+
+# 格式化文件系统
+# 参数1:  块设备名
+# 参数2:  分区1用途: boot=B rootfs=R other=O
+# 参数3： 分区1类型: fat16|fat32|ext4|xfs|btrfs|f2fs
+# 参数4： 分区1卷标
+# 参数5:  分区2用途: boot=B rootfs=R other=O
+# 参数6： 分区2类型: fat16|fat32|ext4|xfs|btrfs|f2fs
+# 参数7： 分区2卷标
+# 参数8:  分区3用途: boot=B rootfs=R other=O
+# 参数9： 分区3类型: fat16|fat32|ext4|xfs|btrfs|f2fs
+# 参数10: 分区3卷标
+# 参数11: 分区4用途: boot=B rootfs=R other=O
+# 参数12: 分区4类型: fat16|fat32|ext4|xfs|btrfs|f2fs
+# 参数13：分区4卷标
+function make_filesystem() {
+    local device_name=$1
+    check_block_dev $device_name
+    shift
+
+    echo "==================================================================="
+    echo "在 [$device_name] 上创建文件系统 ... " 
+    i=1
+    while [ $i -le 4 ]; do
+        local fs_use=$1
+        shift
+        local fs_type=$1
+        shift
+        local fs_label=$1
+        shift
+        if [ "$fs_use" == "" ] || [ "$fs_type" == "" ] || [ "$fs_label" == "" ];then
+             break
+        fi
+
+        local fs_uuid=$(uuidgen)
+        case $fs_use in
+            B) if [ "$fs_type" == "ext4" ] || [ "$fs_type" == "xfs" ] || [ "$fs_type" == "btrfs" ] || [ "$fs_type" == "f2fs" ];then
+                    BOOT_UUID=${fs_uuid}
+                    echo "The boot uuid is ${BOOT_UUID}"
+                    export BOOT_UUID
+               fi
+               BOOT_LABEL=${fs_label}
+               echo "The boot label is ${BOOT_LABEL}"
+               export BOOT_LABEL
+               ;;
+            R) ROOTFS_UUID=${fs_uuid}
+               ROOTFS_LABEL=${fs_label}
+               echo "The rootfs uuid is ${ROOTFS_UUID}"
+               echo "The rootfs label is ${ROOTFS_LABEL}"
+               export ROOTFS_UUID ROOTFS_LABEL
+               ;;
+            O) ;;
+            *) echo "分区用途： [$fs_use] 无法识别！仅支持 B/R/O 三种!"
+               detach_loopdev
+               exit 1
+               ;;
+        esac
+
+        echo "格式化 [${device_name}p${i}], 类型为 [$fs_type], 卷标为 [$fs_label] ... "
+        wait_dev ${device_name}p${i}
+        case $fs_type in 
+            fat16) mkfs.vfat -F 16 -n "${fs_label}" ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+            fat32) mkfs.vfat -F 32 -n "${fs_label}" ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+             ext4) mkfs.ext4 -U ${fs_uuid} -L "${fs_label}" -b 4k ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+              xfs) mkfs.xfs -U ${fs_uuid} -L "${fs_label}" ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+             f2fs) mkfs.f2fs -U ${fs_uuid} -l "${fs_label}" ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+            btrfs) mkfs.btrfs -U ${fs_uuid} -L "${fs_label}" -m single ${device_name}p${i}
+                   if [ $? -ne 0 ];then
+                        echo "[${device_name}p${i}] 格式化失败！"
+                        detach_loopdev
+                        exit 1
+                   else
+                        echo "[${device_name}p${i}] 格式化成功"
+                   fi
+                   ;;
+                *) echo "文件系统类型 [$fs_type] 不受支持!"
+                   detach_loopdev
+                   exit 1
+                   ;;
+        esac
+
+        i=$((i+1))
+    done
+    echo "[$device_name] 文件系统已创建." 
+    echo "==================================================================="
+    echo
+}
+
+function mount_fs() {
+    local device_name=$1
+    check_block_dev $device_name
+
+    local mount_point=$2
+    check_dir $mount_point
+
+    local fs_type=$3
+    if [ -z "$fs_type" ];then
+         echo "未指定文件系统类型"
+         detach_loopdev
+         exit 1
+    fi
+
+    local mount_options=$4
+
+    echo -n "挂载 ${device_name} --> ${mount_point} ... "
+    if [ "$mount_options" == "" ];then
+        mount -t "$fs_type" "$device_name" "$mount_point"
+    else
+        mount -t "$fs_type" -o "$mount_options" "$device_name" "$mount_point"
+    fi
+    if [ $? -ne 0 ];then
+         echo "失败!"
+         detach_loopdev
+         exit 1
+    else
+         echo "成功"
+    fi
+}
+
+function extract_rootfs_files() {
+   echo -n "释放 Openwrt rootfs 压缩包 ... "
+   (
+       cd ${TGT_ROOT} && \
+          tar --exclude="./lib/firmware/*" --exclude="./lib/modules/*" -xzf "$OPWRT_ROOTFS_GZ" && \
+          mkdir -p .reserved boot rom overlay proc sys run ./etc/modprobe.d ./etc/modules.d.remove && \
+          sync
+   )
+   if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+   else 
+        echo "完成"
+   fi
+   echo -n "裁减 Rootfs 中用不到的文件 ... "
+   (
+       cd ${TGT_ROOT}
+       rm -rf ./lib/firmware/* ./lib/modules/*
+       rm -f ./etc/docker-init ./sbin/firstboot ./sbin/jffs2reset ./sbin/jffs2mark
+       # for collectd
+       [ -f ./etc/ppp/options-opkg ] && mv ./etc/ppp/options-opkg ./etc/ppp/options
+       chmod 755 ./etc/init.d/*
+       rm -f ./etc/rc.d/S80nginx 2>/dev/null
+       local ps="${PLATFORM}_${SOC}"
+       case $ps in 
+           amlogic_s905) # s905不支持硬件aes，所以必须删除 ss-rust 程序
+                         [ -f ./usr/bin/sslocal ] && rm -f ./usr/bin/sslocal
+                         [ -f ./usr/bin/ssserver ] && rm -f ./usr/bin/ssserver
+                         ;;
+       esac
+   )
+   echo "完成"
+
+   echo -n "重新链接 kmod 程序 ... "
+   (  cd $TGT_ROOT/sbin 
+      [ ! -x "kmod" ] && [ -f "${KMOD}" ] && cp "$KMOD" kmod
+      if [ -x "kmod" ];then
+          rm -f depmod insmod lsmod modinfo modprobe rmmod
+          ln -sf kmod depmod
+          ln -sf kmod insmod
+          ln -sf kmod lsmod
+          ln -sf kmod modinfo
+          ln -sf kmod modprobe
+          ln -sf kmod rmmod
+      fi
+   )
+   echo "完成"
+
+   echo -n "释放 Armbian firmware 压缩包 ... "
+   ( cd ${TGT_ROOT} && tar xJf "$FIRMWARE_TXZ" && sync )
+   if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+   else 
+        echo "完成"
+   fi
+
+   if [ -d "${FMW_HOME}" ];then
+       echo -n "复制 Added firmware 文件 ... "
+       ( cd ${TGT_ROOT} && cp -a ${FMW_HOME}/* lib/firmware/ && sync )
+       echo "完成"
+    fi
+
+   echo -n "优化 firmware ... "
+   
+       echo "完成"
+   
+   echo -n "释放 Kernel modules 压缩包 ... "
+   ( 
+      cd ${TGT_ROOT} && \
+          mkdir -p lib/modules && \
+          cd lib/modules && \
+              tar xzf ${MODULES_TGZ} && \
+              cd ${KERNEL_VERSION}/ && \
+                  find . -name '*.ko' -exec ln -sf {} . \; && \
+                  rm -f "build" "source" "ntfs.ko" && \
+          sync
+   )
+   if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+   else 
+        echo "完成"
+   fi
+
+   if [ -n "$MODEL_DB" ] && [ -f "$MODEL_DB" ];then
+       echo "复制硬件机型数据库 ..."
+       cp -v "$MODEL_DB" ${TGT_ROOT}/etc/model_database.txt
+       echo "完成"
+   fi 
+}
+
+function extract_amlogic_boot_files() {
+    echo -n "释放 Kernel zImage、uInitrd 及 dtbs 压缩包 ... "
+    ( 
+        cd ${TGT_BOOT} && \
+            cp "${BOOTFILES_HOME}"/* . && \
+            tar xzf "${BOOT_TGZ}" && \
+            rm -f initrd.img-${KERNEL_VERSION} && \
+            cp vmlinuz-${KERNEL_VERSION} zImage && \
+            cp uInitrd-${KERNEL_VERSION} uInitrd && \
+            cp ${UBOOT_WITHOUT_FIP_HOME}/* . && \
+            mkdir -p dtb/amlogic && \
+            cd dtb/amlogic && \
+            tar xzf "${DTBS_TGZ}" && \
+            sync
+    )
+    if [ $? -ne 0 ];then
+         echo "失败！"
+         detach_loopdev
+         exit 1
+    fi
+    ( 
+        cd ${TGT_BOOT}
+        # 5.4内核不再需要u-boot.sd 以及 u-boot.usb
+        rm -f u-boot.usb u-boot.sd
+        # 5.10以后的内核，需要增加u-boot重载
+        # 5.4内核可加可不加
+        if [ $K510 -eq 1 ];then
+            check_file ${UBOOT_WITHOUT_FIP}
+            cp -f ${UBOOT_WITHOUT_FIP} u-boot.ext
+            if [ $? -ne 0 ];then
+                echo "失败！"
+                detach_loopdev
+                exit 1
+            fi
+        fi
+    ) 
+    echo "完成"
+}
+
+function extract_rockchip_boot_files() {
+    echo -n "释放 Kernel zImage、uInitrd 及 dtbs 压缩包 ... "
+    ( 
+          cd ${TGT_BOOT} && \
+              cp -v "${BOOTFILES_HOME}"/* . && \
+              tar xzf "${BOOT_TGZ}" && \
+              rm -f initrd.img-${KERNEL_VERSION} && \
+              ln -sf vmlinuz-${KERNEL_VERSION} Image && \
+              ln -sf uInitrd-${KERNEL_VERSION} uInitrd && \
+              mkdir -p dtb-${KERNEL_VERSION}/rockchip && \
+              ln -sf dtb-${KERNEL_VERSION} dtb && \
+              cd dtb/rockchip && \
+              tar xzf "${DTBS_TGZ}" && \
+              sync
+    )
+    if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+    else 
+        echo "完成"
+    fi
+}
+
+function extract_allwinner_boot_files() {
+    echo -n "释放 Kernel zImage、uInitrd 及 dtbs 压缩包 ... "
+    ( 
+        cd ${TGT_BOOT} && \
+            cp "${BOOTFILES_HOME}"/* . && \
+            tar xzf "${BOOT_TGZ}" && \
+            rm -f initrd.img-${KERNEL_VERSION} && \
+            cp vmlinuz-${KERNEL_VERSION} zImage && \
+            cp uInitrd-${KERNEL_VERSION} uInitrd && \
+            mkdir -p dtb/allwinner && \
+            cd dtb/allwinner && \
+            tar xzf "${DTBS_TGZ}" && \
+            sync
+    )
+    if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+    else 
+        echo "完成"
+    fi
+}
+
+function extract_qemu-aarch64_boot_files() {
+    echo -n "释放 Kernel vmlinuz、initrd.img 及 grub2 压缩包 ... "
+    ( 
+        cd ${TGT_ROOT}/boot && \
+	    mkdir -p efi && \
+	    tar xzf "${BOOTFILES_HOME}/grub2.tar.gz" && \
+            tar xzf "${BOOT_TGZ}" && \
+            ln -s initrd.img-${KERNEL_VERSION} initrd.img && \
+	    ln -s vmlinuz-${KERNEL_VERSION} vmlinuz && \
+            rm -f uInitrd* && \
+        cd ${TGT_BOOT} && \
+	    tar xzf "${BOOTFILES_HOME}/EFI.tar.gz" && \
+	    sync
+    )
+    if [ $? -ne 0 ];then
+        echo "失败！"
+        detach_loopdev
+        exit 1
+    else 
+        echo "完成"
+    fi
+}
+
+# 生成 openwrt 所需的 fstab 文件
+function create_fstab_config() {
+    echo "创建 fstab 配置文件 ... "
+    (
+        cd $TGT_ROOT
+	if [ "$PLATFORM" == "qemu-aarch64" ];then
+            cat > ./etc/fstab <<EOF
+UUID=${ROOTFS_UUID} / btrfs compress=zstd:${ZSTD_LEVEL} 0 1
+LABEL=${BOOT_LABEL} /boot/efi vfat noatime,errors=remount-ro 0 2
+#tmpfs /tmp tmpfs defaults,nosuid 0 0
+EOF
+        elif [ ! -z "${BOOT_UUID}" ];then
+            cat > ./etc/fstab <<EOF
+UUID=${ROOTFS_UUID} / btrfs compress=zstd:${ZSTD_LEVEL} 0 1
+UUID=${BOOT_UUID} /boot ext4 noatime,errors=remount-ro 0 2
+#tmpfs /tmp tmpfs defaults,nosuid 0 0
+EOF
+        else 
+            cat > ./etc/fstab <<EOF
+UUID=${ROOTFS_UUID} / btrfs compress=zstd:${ZSTD_LEVEL} 0 1
+LABEL=${BOOT_LABEL} /boot vfat defaults 0 2
+#tmpfs /tmp tmpfs defaults,nosuid 0 0
+EOF
+        fi
+
+        cat > ./etc/config/fstab <<EOF
+config global
+        option anon_swap '0'
+        option auto_swap '0'
+        option anon_mount '1'
+        option auto_mount '1'
+        option delay_root '5'
+        option check_fs '0'
+
+config mount
+        option target '/overlay'
+        option enabled '1'
+        option enabled_fsck '1'
+        option uuid '${ROOTFS_UUID}'
+        option fstype 'btrfs'
+        option options 'compress=zstd:${ZSTD_LEVEL}'
+
+EOF
+
+        if [ "$PLATFORM" == "qemu-aarch64" ];then
+            cat >> ./etc/config/fstab <<EOF
+config mount
+        option target '/boot/efi'
+        option enabled '1'
+        option enabled_fsck '1'
+EOF
+        else
+            cat >> ./etc/config/fstab <<EOF
+config mount
+        option target '/boot'
+        option enabled '1'
+        option enabled_fsck '1'
+EOF
+	fi
+
+        if [ "$PLATFORM" == "qemu-aarch64" ];then
+            cat >> ./etc/config/fstab <<EOF
+        option label '${BOOT_LABEL}'
+        option fstype 'vfat'
+EOF
+        elif [ ! -z "${BOOT_UUID}" ];then
+            cat >> ./etc/config/fstab <<EOF
+        option uuid '${BOOT_UUID}'
+        option fstype 'ext4'
+
+EOF
+        else
+            cat >> ./etc/config/fstab <<EOF
+        option label '${BOOT_LABEL}'
+        option fstype 'vfat'
+
+EOF
+        fi
+    )
+    echo "当前 fstab 内容如下："
+    echo "==============================================="
+    cat $TGT_ROOT/etc/config/fstab
+    echo "==============================================="
+    echo
+}
+
+# 写入 banner 信息
+function write_banner() {
+    echo "写入 banner 信息 ... "
+    (
+        cd $TGT_ROOT
+        if [ -f $BANNER ];then
+            cp -f $BANNER ./etc/banner
+            echo " Base on OpenWrt ${OPENWRT_VER}" >> etc/banner
+            TODAY=$(date +%Y-%m-%d)
+            echo " Packaged by ${WHOAMI} on ${TODAY}" >> etc/banner
+            echo " PLATFORM: ${PLATFORM}  SOC: ${SOC}  BOARD: ${BOARD}" >> etc/banner
+            echo >> etc/banner
+        fi
+    )
+    cat $TGT_ROOT/etc/banner
+    echo 
+}
+
+# 配置 first run 程序
+function config_first_run() {
+    echo "创建 [初次使用] 应用环境 ... "
+    (
+         cd $TGT_ROOT
+         # First run, 第一次启动时自动创建新分区及格式化
+         if [ -n "$FIRSTRUN_SCRIPT" ] && [ -f "$FIRSTRUN_SCRIPT" ];then
+              cp -v "$FIRSTRUN_SCRIPT" ./etc/first_run.sh && \
+                  sed -e "s/MYSELF=\$0/MYSELF=\"\/etc\/first_run.sh\"/" -i ./etc/first_run.sh && \
+                  chmod 755 ./etc/first_run.sh
+              cp -v "./etc/rc.local" "./etc/rc.local.orig"
+              echo -e "${SKIP_MB}\t${BOOT_MB}\t${ROOTFS_MB}" > ./etc/part_size
+              sed -e "/exit/i\/etc/first_run.sh >/root/first_run.log 2>&1" -i etc/rc.local
+              echo "完成"
+          else
+              echo "未发现相关依赖，跳过配置"
+          fi
+
+    )
+    echo
+}
+
+# 复制 u-boot 到文件系统
+function copy_uboot_to_fs() {
+    (
+        cd $TGT_ROOT
+        if [ "$BOARD" == "vplus" ] && [ -n "${UBOOT_BIN}" ] && [ -f ${UBOOT_BIN} ];then
+            echo "检测到 vplus 机型，正在把 u-boot 相关文件写入到 /lib/u-boot目录中备用 ... "
+            mkdir -p ./lib/u-boot
+            cp -v ${UBOOT_BIN} ./lib/u-boot/
+            cp -v ${WRITE_UBOOT_SCRIPT} ./lib/u-boot/
+            echo "完成"
+        fi
+
+        if [ "$PLATFORM" == "amlogic" ] && [ -n "$FIP_HOME" ] && [ -d "${FIP_HOME}" ];then
+            echo "检测到 amlogic 平台，正在把主线 u-boot 相关文件写入到 /lib/u-boot 目录中备用 ... "
+            mkdir -p ./lib/u-boot
+            cp -v "${FIP_HOME}"/../*.sh lib/u-boot/
+            cp -v "${FIP_HOME}"/*.sd.bin lib/u-boot/
+            echo "完成"
+        fi
+
+        if [ "$PLATFORM" == "amlogic" ] && [ -n "$BTLD_BIN" ] && [ -f "${BTLD_BIN}" ];then
+            echo "检测到 amlogic 平台，正在把安卓 u-boot 相关文件写入到 /lib/u-boot 目录中备用 ... "
+            mkdir -p ./lib/u-boot
+            cp -v "$BTLD_BIN" lib/u-boot/
+            echo "完成"
+        fi
+    )
+    echo
+}
+
+# 写入 u-boot 到磁盘镜像
+function write_uboot_to_disk() {
+    (
+        if [ "$PLATFORM" == "allwinner" ] && [ -n "$UBOOT_BIN" ] && [ -f "$UBOOT_BIN" ];then
+            echo "写入 bootloader ..."
+
+            echo "dd if=${UBOOT_BIN} of=${TGT_DEV} conv=fsync,notrunc bs=1024 seek=8"
+
+            dd if="${UBOOT_BIN}" of="${TGT_DEV}" conv=fsync,notrunc bs=1024 seek=8
+
+            sync
+            echo "完成"
+        fi
+
+	# rockchip的bootloader，统一从硬盘的第65个扇区开始至16MB这个范围
+        if [ "$PLATFORM" == "rockchip" ] && [ -n "$BOOTLOADER_IMG" ] && [ -f "$BOOTLOADER_IMG" ];then
+            echo "写入 bootloader ..."
+            local btld_home=${BOOTLOADER_IMG%/*}
+	    if [ -f "${btld_home}/idbloader.img" ] && [ -f "${btld_home}/u-boot.itb" ];then
+                echo "dd if=${btld_home}/idbloader.img of=${TGT_DEV} conv=fsync,notrunc bs=512 seek=64"
+                dd if=${btld_home}/idbloader.img of=${TGT_DEV} conv=fsync,notrunc bs=512 seek=64
+                echo "dd if=${btld_home}/u-boot.itb of=${TGT_DEV} conv=fsync,notrunc bs=512 seek=16384"
+                dd if=${btld_home}/u-boot.itb of=${TGT_DEV} conv=fsync,notrunc bs=512 seek=16384
+            else
+                echo "dd if=${BOOTLOADER_IMG} of=${TGT_DEV} conv=fsync,notrunc bs=512 skip=64 seek=64"
+                dd if=${BOOTLOADER_IMG} of=${TGT_DEV} conv=fsync,notrunc bs=512 skip=64 seek=64
+            fi
+            sync
+
+            echo "完成"
+        fi
+
+        if [ "$PLATFORM" == "amlogic" ] && [ -n "$UBOOT_WITH_FIP" ] && [ -f "$UBOOT_WITH_FIP" ];then
+            echo "写入 bootloader ..."
+            echo "dd if=${UBOOT_WITH_FIP}  of=${TGT_DEV} conv=fsync,notrunc bs=512 skip=1 seek=1"
+            echo "dd if=${UBOOT_WITH_FIP}  of=${TGT_DEV} conv=fsync,notrunc bs=1 count=444"
+
+            dd if=${UBOOT_WITH_FIP}  of=${TGT_DEV} conv=fsync,notrunc bs=512 skip=1 seek=1
+            dd if=${UBOOT_WITH_FIP}  of=${TGT_DEV} conv=fsync,notrunc bs=1 count=444
+
+            sync
+            echo "完成"
+        fi
+    )
+    echo
+}
+
+# 清理环境
+function clean_work_env() {
+    echo -n "清理环境 ... "
+    detach_loopdev
+    sync
+    echo "完成"
+    echo
+}
